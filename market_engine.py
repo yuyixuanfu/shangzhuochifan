@@ -60,6 +60,14 @@ try:
 except ImportError:
     DAY_END_EVENTS = []
 
+# 神秘时空层（可选——缺文件不崩）
+try:
+    from mystic_engine import MysticLayer
+    from mystic_data import MYSTIC_STALL_IDS
+except ImportError:
+    MysticLayer = None
+    MYSTIC_STALL_IDS = []
+
 def _save_dir():
     """获取存档目录——兼容exec环境"""
     try:
@@ -177,6 +185,10 @@ class MarketGame:
         self._journey_shown = False
         self._today_solar_term = None  # 当天节气事件
         self.storyline_state = {}  # {vendor_name: {"arc": arc_name, "day": day_num}}
+        # 神秘时空层
+        self.mystic = MysticLayer(self) if MysticLayer else None
+        self.in_mystic = False
+        self.savings = 0  # 攒钱罐——昨天剩的一半存进来，跨天保存
 
     # ---- 存档 ----
 
@@ -284,6 +296,8 @@ class MarketGame:
             "dish_history": getattr(self, "dish_history", {}),
             "rt_storyline_state": getattr(self, "storyline_state", {}),
             "rt_solar_term": getattr(self, '_today_solar_term', None),
+            "savings": getattr(self, "savings", 0),
+            "mystic_state": (self.mystic.state_for_save() if self.mystic else None),
         }
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -413,6 +427,9 @@ class MarketGame:
         self.dish_history = data.get("dish_history", {})
         self.storyline_state = data.get("rt_storyline_state", {})
         self._today_solar_term = data.get("rt_solar_term", None)
+        self.savings = data.get("savings", 0)
+        if self.mystic:
+            self.mystic.load_state(data.get("mystic_state") or {})
         return True
 
     # ---- 新一局 ----
@@ -426,14 +443,23 @@ class MarketGame:
             self.seed = int(time.time()) & 0xFFFFFFFF
         self.rng = mulberry32(self.seed)
 
+        _prev_day = self.day  # 神秘时空时间循环需知昨天、结转需知是否第一局
         self.day += 1
         self.turn = 0
+        # 神秘时空：时间循环回退——若昨天在异市做了标记交易，回退1天
+        if self.mystic:
+            loop_back, self._time_loop_narrative = self.mystic.maybe_time_loop(_prev_day)
+            if loop_back:
+                self.day -= 1  # 回退1天
         # 上局没做完——买的菜存进冰箱（保鲜0天的扔了）
         if not self.done and self.basket:
             for item in self.basket:
                 keep = KEEP_DAYS.get(item["name"], 3)
                 if keep > 0:
-                    self.fridge.append({"name": item["name"], "quality": item["quality"], "qty": item.get("qty", 1), "keep_days": keep})
+                    fitem = {"name": item["name"], "quality": item["quality"], "qty": item.get("qty", 1), "keep_days": keep}
+                    if item.get("exotic"):  # 神秘时空exotic标记跨天保留
+                        fitem["exotic"] = item["exotic"]
+                    self.fridge.append(fitem)
         self.done = False
         self.basket = []
         self.cooking_log = []
@@ -468,9 +494,23 @@ class MarketGame:
         else:
             self.weather = "雨"
 
+        # ── 结转 + 攒钱罐 ──
+        # 昨天剩的钱：一半结转到今天预算，另一半进攒钱罐（「取罐」取出）
+        # 只有真有"昨天"（prev_day>=1）才结转——第一局别凭空发钱
+        if _prev_day >= 1:
+            leftover = max(0, round(self.budget - self.spent, 1))
+            carry = round(leftover / 2, 1)
+            jar_add = round(leftover - carry, 1)
+            self.savings = round(self.savings + jar_add, 1)
+        else:
+            leftover = carry = jar_add = 0
+        _savings_before = self.savings
+
         # roll 预算 (8~28)——紧巴巴，买不起好菜才是常态
-        self.budget = 8 + (self.rng() % 21)
+        self.budget = 8 + (self.rng() % 21) + carry
         self.spent = 0
+        self._carry_hint = carry
+        self._jar_before = _savings_before
 
         # roll 时段
         t = self.rng() % 10
@@ -623,6 +663,23 @@ class MarketGame:
         if self._today_solar_term:
             self._apply_solar_term_effects(self._today_solar_term)
 
+        # ── 神秘时空层 ──
+        if self.mystic:
+            # 上局结束先清当日标记，再加进度（雨天+2/散市+1）
+            self.mystic.end_of_day_clear()
+            delta = 1
+            if self.weather == "雨":
+                delta += 2
+            if self.time_of_day == "散市":
+                delta += 1
+            self.mystic.tick_progress(delta)
+            if self.mystic.check_trigger():
+                self.mystic.on_day_start()
+            self.in_mystic = self.mystic.state["in_mystic"]
+            self._mystic_chain_hints = self.mystic.check_mystic_chains()
+        else:
+            self._mystic_chain_hints = []
+
         self.save()
         return self._day_header(expired)
 
@@ -649,7 +706,30 @@ class MarketGame:
         tod_desc = tod.get("desc", "")
         if tod_desc:
             lines.append(tod_desc)
+        # 神秘时空日提示
+        if self.mystic:
+            mystic_hint = self.mystic.day_header_hint()
+            if mystic_hint:
+                lines.append(mystic_hint)
+        # 时间循环回退叙事
+        if getattr(self, '_time_loop_narrative', None):
+            lines.append("")
+            lines.append(self._time_loop_narrative)
+            self.mystic.consume_time_loop_flag()
+        # 隐藏任务线解锁提示
+        for h in getattr(self, '_mystic_chain_hints', []) or []:
+            lines.append("")
+            lines.append(h)
         lines.append(f"菜钱：{self.budget}元")
+        # 攒钱罐/结转提示
+        carry = getattr(self, '_carry_hint', 0)
+        jar_now = self.savings
+        if carry > 0 and jar_now > 0:
+            lines.append(f"  （昨天剩的一半{carry}元结转，另一半进攒钱罐；罐里现在{jar_now}元，用「取罐」取出）")
+        elif carry > 0:
+            lines.append(f"  （昨天剩的{carry}元结转过来了）")
+        elif jar_now > 0:
+            lines.append(f"  （攒钱罐里有{jar_now}元，用「取罐」取出）")
         # 天灾人祸
         if self._today_disaster:
             d = self._today_disaster
@@ -794,6 +874,12 @@ class MarketGame:
                         continue
                 lines.append(f"  🌟 {ws['name']}（{ws['owner']}）— 限时！")
 
+        # 神秘时空：异宾摊出现
+        if self.mystic:
+            mystic_hint = self.mystic.look_stalls_hint()
+            if mystic_hint:
+                lines.append(mystic_hint)
+
         new_secrets = self._check_secret_unlocks()
         for area in new_secrets:
             lines.append("")
@@ -879,6 +965,9 @@ class MarketGame:
             stall = self._find_stall(stall_id)
             owner = stall["owner"] if stall else "摊主"
             return f"今天{owner}没出摊。下次再来吧。"
+        # 神秘时空：异宾摊走 mystic 层
+        if stall_id in MYSTIC_STALL_IDS and self.mystic:
+            return self.mystic.visit_mystic_stall(stall_id)
         if stall_id in SECRET_AREAS:
             return self._visit_secret_area(stall_id)
         stall = self._find_stall(stall_id)
@@ -1365,7 +1454,7 @@ class MarketGame:
             price = round(price * 0.9, 1)
 
         # 4级=赊账——预算不够也能买
-        can_owe = regular_tier >= 4
+        can_owe = regular_tier >= 3  # 3级熟人=赊账（门槛从4级降到3级）
 
         if price > money_left and not can_owe:
             return f"钱不够。{item_name}{_fq(qty)}{v['unit']}要{price}元，你只剩{money_left}元。"
@@ -1413,6 +1502,9 @@ class MarketGame:
         if self.budget - self.spent < 0:
             owing = round(self.spent - self.budget, 1)
             owe_hint = f"⚠ 超预算了，欠{owing}元。"
+            # 神秘时空：赊账计数（异界收账人任务线用）
+            if self.mystic and can_owe:
+                self.mystic.state["unpaid_count"] = self.mystic.state.get("unpaid_count", 0) + 1
         # 统计——买好菜/坏菜
         if quality in ("great", "good"):
             self.stats["good_buy_streak"] += 1
@@ -1984,16 +2076,19 @@ class MarketGame:
                     step_full = f"炒{step}"
 
             # 补全食材——步骤没提具体食材名时，加上还没入锅的
+            # 只补玩家主动买的主料，不补 KITCHEN_DEFAULTS（葱姜蒜是调味，玩家提了才下）
             ks = self.kitchen_state
             if ks:
-                _seasoning_names = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱"}
-                all_items = list(self.fridge) + list(self.basket) + KITCHEN_DEFAULTS
-                mentioned = {item["name"] for item in all_items if item["name"] in step_full}
+                _seasoning_names = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱", "葱", "姜", "蒜"}
+                _kitchen_default_names = {d["name"] for d in KITCHEN_DEFAULTS}
+                main_items = [item for item in (list(self.fridge) + list(self.basket))
+                              if item["name"] not in _seasoning_names
+                              and item["name"] not in _kitchen_default_names]
+                mentioned = {item["name"] for item in main_items if item["name"] in step_full}
                 in_pot = set(ks.get("pot_contents") or [])
                 on_board = ks.get("_on_board") or set()
-                unhandled = [item["name"] for item in all_items
-                            if item["name"] not in _seasoning_names
-                            and item["name"] not in mentioned
+                unhandled = [item["name"] for item in main_items
+                            if item["name"] not in mentioned
                             and item["name"] not in in_pot
                             and item["name"] not in on_board]
                 if unhandled and any(v in step_full for v in ["炒", "煮", "炖", "煎", "炸", "烧", "蒸", "焖"]):
@@ -2248,6 +2343,11 @@ class MarketGame:
                             feedback.append(f"⚠ {trap_msg}")
                             ks["quality_score"] -= 3
                             item["quality"] = "bad"
+                    # 神秘时空：exotic 食材切/洗时揭穿"不属于这个时空"
+                    if self.mystic and item.get("exotic") and verb in ("切", "洗", "剥", "切块", "切片", "切丝", "切段", "切丁", "切末", "拍", "拍碎", "沥干", "打散"):
+                        ex_fb = self.mystic.apply_exotic_reveal(item, verb)
+                        if ex_fb:
+                            feedback.append(ex_fb)
                 # 使用升级版反馈——优先食材特有感官
                 fb_key_map = {"洗": "洗好", "切": "切好", "切段": "切好", "切片": "切好",
                               "切丝": "切好", "切块": "切好", "拍": "切好", "剥": "切好",
@@ -2443,7 +2543,7 @@ class MarketGame:
 
             elif tag == "hold":
                 # 盛出——把东西从锅里拿出来放一边
-                _seasoning_hold = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱"}
+                _seasoning_hold = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱", "葱", "姜", "蒜"}
                 cookable_in_pot = [n for n in ks["pot_contents"] if n not in _seasoning_hold]
 
                 # 判断：是指定盛出某几样，还是全盛
@@ -2869,6 +2969,13 @@ class MarketGame:
             journey_parts.append("盐没控制好")
         if ks.get("accidents_happened"):
             journey_parts.append("厨房里出了点状况")
+        # 神秘时空：exotic 食材端上桌的异象叙事
+        if self.mystic and used_items_info:
+            exotic_item = next((it for it in used_items_info if it.get("exotic")), None)
+            if exotic_item:
+                drama = self.mystic.apply_exotic_serve(exotic_item)
+                if drama:
+                    journey_parts.append(drama)
         # 拼叙事
         if journey_parts:
             narrative = "、".join(journey_parts) + "。"
@@ -3514,8 +3621,12 @@ class MarketGame:
         if sh != "不懂":
             skill_str += f"👀{sh}"
         base = f"💰{money_left}元 | 🛒{basket_str} | 🧊{fridge_str} | {time_str} | {self.season}·{self.weather}"
+        if self.savings > 0:
+            base += f" | 🐖罐{self.savings}"
         if skill_str:
             base += f" | {skill_str}"
+        if self.in_mystic:
+            base += " | 🌀"
         return base
 
     def _fridge_str(self):
@@ -5287,13 +5398,27 @@ class MarketGame:
         if instruction in ("help", "帮助"):
             return self._help()
 
-        # 还没开新局，自动开一局
-        if self.day == 0:
+        # 还没开新局，自动开一局（"新局"指令本身下面会调，别代开导致双开跳天）
+        if self.day == 0 and instruction != "新局":
             self.new_day()
 
         # 新局——需要明确的"新局"指令，防止AI误触
         if instruction == "新局":
             return self.new_day()
+
+        # 神秘时空：「答 XXX」——回答鬼摊的问题，原话存档换 exotic 食材
+        if instruction.startswith("答 ") and self.mystic:
+            r = self.mystic.handle_answer(instruction[2:].strip())
+            self.save()  # 持久化 mystic_state（confessions/time_loop_pending）+ basket
+            return r
+
+        # 取攒钱罐——把罐里的钱取出加到本局预算
+        if instruction == "取罐" and self.savings > 0:
+            take = self.savings
+            self.savings = 0
+            self.budget = round(self.budget + take, 1)
+            self.save()
+            return f"从攒钱罐取出{take}元，加到今天的菜钱里。现在有{self.budget}元。"
 
         # 回退天数——"回退3"回到3天前
         if instruction.startswith("回退"):
