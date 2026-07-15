@@ -143,7 +143,7 @@ async def call_tool(name, arguments):
         market_time_max = state.get("market_time_max", 0)
         done = state.get("done", False)
         basket = state.get("basket", [])
-        kitchen = state.get("_kitchen_state")
+        kitchen = state.get("kitchen_state")
 
         lines = [
             f"第{day}天 | {season} | {weather}",

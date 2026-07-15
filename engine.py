@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""上桌吃饭 — AI可玩版引擎
+"""上桌吃饭 — AI可玩版引擎（薄壳）
 
-接口（跟钓鱼游戏一样）:
+接口（跟钓鱼游戏/词与物一样）:
   new_game(seed)    → (state, text)   开新局
   cmd(state, inst)  → (state, text)   执行指令
   load_game()       → state | None    从文件读
@@ -11,17 +11,24 @@ AI接入方式:
   1. 函数调用: import engine; state = engine.new_game()[0]; state, text = engine.cmd(state, "菜场")
   2. 命令行:   python engine.py "菜场"  (自动读存档、执行、存回)
   3. HTTP API: python engine.py --serve  (Flask, port 8877)
+  4. MCP工具:  配合 market_mcp_server.py
 
 特性:
-  - 批量指令: "买 番茄 2;买 鸡蛋 1" 分号串联
+  - 批量指令: "买 番茄;买 鸡蛋 1" 分号串联
   - 状态栏JSON: 每次输出末尾带紧凑状态
-  - 确定性PRNG: 同seed同指令=同结果
-  - 半斤支持: "买 五花肉 0.5" 或 "买 五花肉 半斤"
+  - 确定性PRNG: 同seed同指令=同结果（rng调用进度也存档，跨进程一致）
+
+── 设计 ──────────────────────────────────────────────
+本文件只是薄壳：所有游戏逻辑在 market_engine.py 的 MarketGame。
+存档往返用 MarketGame.to_dict()/from_dict()——一份逻辑，直接调/命令行/MCP
+三条路共用，不再各自维护快照（旧版 _snapshot/_restore 的 dir 全量快照脆弱，
+和 MarketGame 自带 save/load 两套打架）。state 就是 to_dict() 的输出，
+字段平铺本名（season/weather/basket/...），MCP status 直接读。
 """
 
 import sys, os, io, json, time
 
-# 确保UTF-8输出
+# 确保UTF-8输出（Windows终端默认gbk会崩emoji）
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -29,195 +36,15 @@ try:
     _HERE = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     _HERE = os.getcwd()
-_SAVE_FILE = os.path.join(_HERE, "market_engine_save.json")
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-# ── 确定性PRNG ──────────────────────────────────────
-def mulberry32(seed):
-    """确定性随机数生成器。同seed=同序列。"""
-    def _gen():
-        nonlocal seed
-        while True:
-            seed = (seed + 0x6D2B79F5) & 0xFFFFFFFF
-            t = seed
-            t = ((t ^ (t >> 15)) * (t | 1)) & 0xFFFFFFFF
-            t = ((t ^ (t >> 15)) * (t | 1)) & 0xFFFFFFFF
-            yield (t ^ (t >> 15)) & 0xFFFFFFFF
-    return _gen()
+_SAVE_FILE = os.path.join(_HERE, "market_save.json")
 
 
-class _DetRandom:
-    """替换random的确定性随机。"""
-    def __init__(self, seed=42):
-        self._gen = mulberry32(seed)
-        self._state = seed
-
-    def seed(self, s):
-        self._state = s
-        self._gen = mulberry32(s)
-
-    def random(self):
-        return next(self._gen) / 0xFFFFFFFF
-
-    def randint(self, a, b):
-        return a + int(self.random() * (b - a + 1))
-
-    def choice(self, seq):
-        return seq[self.randint(0, len(seq) - 1)]
-
-    def sample(self, seq, k):
-        idxs = list(range(len(seq)))
-        result = []
-        for _ in range(min(k, len(idxs))):
-            i = self.randint(0, len(idxs) - 1)
-            result.append(seq[idxs[i]])
-            idxs.pop(i)
-        return result
-
-    def shuffle(self, seq):
-        for i in range(len(seq) - 1, 0, -1):
-            j = self.randint(0, i)
-            seq[i], seq[j] = seq[j], seq[i]
-
-    def choices(self, population, weights=None, k=1):
-        if weights is None:
-            return [self.choice(population) for _ in range(k)]
-        total = sum(weights)
-        result = []
-        for _ in range(k):
-            r = self.random() * total
-            cum = 0
-            for item, w in zip(population, weights):
-                cum += w
-                if r <= cum:
-                    result.append(item)
-                    break
-            else:
-                result.append(population[-1])
-        return result
-
-
-# ── 注入确定性随机 ─────────────────────────────────
-import random as _stdlib_random
-_det_rng = _DetRandom(42)
-
-
-def _patch_random():
-    """把market_engine的random换成确定性版本。"""
-    import market_engine
-    market_engine.random = _det_rng
-
-
-# ── 快照 ────────────────────────────────────────────
-_SKIP_ATTRS = {'kitchen_state'}  # kitchen_state单独处理（含set）
-
-def _to_jsonable(obj):
-    """递归把不可JSON序列化的东西转成可序列化的。"""
-    if isinstance(obj, set):
-        return {'__t': 'set', 'v': sorted(obj, key=str)}
-    if isinstance(obj, dict):
-        return {k: _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(x) for x in obj]
-    if isinstance(obj, float):
-        return round(obj, 4)  # 避免浮点精度问题
-    return obj
-
-
-def _from_jsonable(obj):
-    """反序列化。"""
-    if isinstance(obj, dict):
-        if obj.get('__t') == 'set':
-            return set(_from_jsonable(x) for x in obj.get('v', []))
-        return {k: _from_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_from_jsonable(x) for x in obj]
-    return obj
-
-
-def _snapshot(game):
-    """把MarketGame所有可序列化属性拍成dict。"""
-    state = {}
-    for attr in dir(game):
-        if attr.startswith('__') or attr in _SKIP_ATTRS:
-            continue
-        val = getattr(game, attr, None)
-        if callable(val):
-            continue
-        try:
-            state[attr] = _to_jsonable(val)
-        except:
-            pass
-    # kitchen_state单独处理——set→list
-    if game.kitchen_state:
-        state['_kitchen_state'] = _to_jsonable(game.kitchen_state)
-    else:
-        state['_kitchen_state'] = None
-    # PRNG状态
-    state['_rng_state'] = _det_rng._state
-    # MarketGame内部rng闭包的当前seed
-    try:
-        state['_game_rng_seed'] = game.rng.__closure__[0].cell_contents
-    except (AttributeError, IndexError):
-        state['_game_rng_seed'] = game.seed
-    return state
-
-
-def _restore(game, state):
-    """从快照恢复。"""
-    rng_state = state.pop('_rng_state', None)
-    if rng_state is not None:
-        _det_rng.seed(rng_state)
-
-    # 恢复MarketGame内部rng闭包
-    game_rng_seed = state.pop('_game_rng_seed', None)
-    if game_rng_seed is not None:
-        from market_engine import mulberry32
-        game.rng = mulberry32(game_rng_seed)
-
-    kitchen_data = state.pop('_kitchen_state', None)
-    # 从state里去掉纯缓存属性（可以lazy重建）
-    for attr in ('_yield_cache', '_stall_item_cache'):
-        state.pop(attr, None)
-    # 以下属性在同一天内跨cmd()必须保持，不pop
-    # _owner_daily, _today_disaster, _disaster_price_mod, _disaster_quality_mod,
-    # _disaster_bargain_bonus, _season_stall_items, _rare_boost_today,
-    # _neighbor_conflict, _roof_leaking, _journey_text, _journey_shown
-
-    for attr, val in state.items():
-        if attr in _SKIP_ATTRS:
-            continue
-        try:
-            setattr(game, attr, _from_jsonable(val))
-        except:
-            pass
-    # 恢复kitchen_state——list→set
-    if kitchen_data:
-        game.kitchen_state = _restore_sets(_from_jsonable(kitchen_data))
-    else:
-        game.kitchen_state = None
-
-
-def _restore_sets(obj):
-    """kitchen_state里的set字段还原。处理两种格式：list和{'__t':'set','v':list}。"""
-    _SET_KEYS = {"completed_steps", "completed_optional", "_on_board", "discovered_recipes"}
-    if isinstance(obj, dict):
-        if obj.get('__t') == 'set':
-            return set(obj.get('v', []))
-        result = {}
-        for k, v in obj.items():
-            if k in _SET_KEYS:
-                if isinstance(v, list):
-                    result[k] = set(v)
-                elif isinstance(v, dict) and v.get('__t') == 'set':
-                    result[k] = set(v.get('v', []))
-                else:
-                    result[k] = _restore_sets(v)
-            else:
-                result[k] = _restore_sets(v)
-        return result
-    if isinstance(obj, list):
-        return [_restore_sets(x) if isinstance(x, (dict, list)) else x for x in obj]
-    return obj
+def _new_game():
+    from market_engine import MarketGame
+    return MarketGame()
 
 
 # ── 状态栏 ──────────────────────────────────────────
@@ -248,42 +75,29 @@ def _status_bar(game):
 
 
 # ── 核心接口 ────────────────────────────────────────
-_initialized = False
-
-def _ensure_init():
-    global _initialized
-    if not _initialized:
-        sys.path.insert(0, _HERE)
-        _patch_random()
-        _initialized = True
-
-
 def new_game(seed=None):
-    """开新局。返回 (state_dict, 开场文字)。"""
-    _ensure_init()
-    from market_engine import MarketGame
+    """开新局。返回 (state_dict, 开场文字)。
+
+    seed 给定时用 seed；否则 MarketGame.new_day 用 time.time()。
+    """
+    game = _new_game()
     if seed is not None:
-        _det_rng.seed(seed)
-    game = MarketGame()
-    # new_day()会load旧存档再重置——但我们要干净的新局
-    game.seed = seed if seed is not None else int(time.time()) & 0xFFFFFFFF
-    text = game.new_day(seed=game.seed)
-    state = _snapshot(game)
+        text = game.new_day(seed=seed, force=True)
+    else:
+        text = game.new_day(force=True)
+    # new_day 已经 save 过；这里把状态拍成 state 返回
+    state = game.to_dict()
     return state, text
 
 
 def cmd(state, instruction):
     """执行指令。返回 (新state, 输出文字)。
 
-    支持分号串联:
-      "买 番茄;买 鸡蛋 2"  → 依次执行
+    支持分号串联: "买 番茄;买 鸡蛋 2" 依次执行
     """
-    _ensure_init()
-    from market_engine import MarketGame
-
-    # 恢复游戏
-    game = MarketGame()
-    _restore(game, state)
+    game = _new_game()
+    # 从 state 恢复——和直接调 market_engine.cmd 走同一份 from_dict 逻辑
+    game.from_dict(state or {})
 
     # 处理分号串联
     if ';' in instruction:
@@ -297,8 +111,8 @@ def cmd(state, instruction):
     else:
         full_text = game.cmd(instruction)
 
-    # 快照新状态
-    new_state = _snapshot(game)
+    # game.cmd 内部每条指令已 save 过（写文件），但 stateless 接口要返回 state
+    new_state = game.to_dict()
     status = _status_bar(game)
     output = full_text + "\n" + status
     return new_state, output
@@ -311,7 +125,7 @@ def load_game():
     try:
         with open(_SAVE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return None
 
 
@@ -319,8 +133,8 @@ def save_game(state):
     """存档到文件。"""
     try:
         with open(_SAVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, separators=(',', ':'))
-    except:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
         pass
 
 
@@ -395,7 +209,6 @@ def _serve():
             state, text = new_game(seed)
             sid = str(int(time.time() * 1000))
             _games[sid] = state
-            # 只保留最近10个session
             while len(_games) > 10:
                 oldest = next(iter(_games))
                 del _games[oldest]

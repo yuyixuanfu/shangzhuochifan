@@ -323,6 +323,32 @@ class MarketGame:
             "mystic_state": (self.mystic.state_for_save() if self.mystic else None),
             "rt_rng_state": self._get_rng_state(),
             "_last_opened_day": getattr(self, "_last_opened_day", None),
+            # ── 当日运行时状态（new_day 每天重算，但当天内跨 cmd/跨进程必须保留） ──
+            # 不存的话 stateless wrapper（engine.py/MCP）from_dict 后 season="" 等，买不了菜。
+            "season": self.season,
+            "weather": self.weather,
+            "time_of_day": self.time_of_day,
+            "_season_day": getattr(self, "_season_day", 1),
+            "_season_ending": getattr(self, "_season_ending", False),
+            "cooking_log": self.cooking_log,
+            "plate": self.plate,
+            "no_weight_trick": self.no_weight_trick,
+            "inspected_items": self.inspected_items,
+            "_owner_daily": getattr(self, "_owner_daily", {}),
+            "_today_disaster_id": (self._today_disaster.get("id") if self._today_disaster else None),
+            "_disaster_price_mod": getattr(self, "_disaster_price_mod", 1.0),
+            "_disaster_quality_mod": getattr(self, "_disaster_quality_mod", 0),
+            "_disaster_bargain_bonus": getattr(self, "_disaster_bargain_bonus", 0),
+            "_rare_boost_today": getattr(self, "_rare_boost_today", False),
+            "_neighbor_conflict": getattr(self, "_neighbor_conflict", False),
+            "_roof_leaking": getattr(self, "_roof_leaking", False),
+            "_max_carry": getattr(self, "_max_carry", 5),
+            "_last_stall": getattr(self, "_last_stall", None),
+            "_journey_text": getattr(self, "_journey_text", ""),
+            "_journey_shown": getattr(self, "_journey_shown", False),
+            # 缓存——能 lazy 重建，但存了省一次重算、也防跨进程抖动
+            "_stall_item_cache": getattr(self, "_stall_item_cache", {}),
+            "_season_stall_items": getattr(self, "_season_stall_items", {}),
         }
         return data
 
@@ -484,6 +510,35 @@ class MarketGame:
         self.storyline_state = data.get("rt_storyline_state", {})
         self._today_solar_term = data.get("rt_solar_term", None)
         self.savings = data.get("savings", 0)
+        # ── 当日运行时状态恢复（和 to_dict 那段对应） ──
+        self.season = data.get("season", "")
+        self.weather = data.get("weather", "晴")
+        self.time_of_day = data.get("time_of_day", "上午")
+        self._season_day = data.get("_season_day", 1)
+        self._season_ending = data.get("_season_ending", False)
+        self.cooking_log = data.get("cooking_log", [])
+        self.plate = data.get("plate", None)
+        self.no_weight_trick = data.get("no_weight_trick", False)
+        self.inspected_items = data.get("inspected_items", {})
+        self._owner_daily = data.get("_owner_daily", {})
+        # _today_disaster 从 id 重建对象
+        _dis_id = data.get("_today_disaster_id")
+        if _dis_id:
+            self._today_disaster = next((d for d in MARKET_DISASTERS if d["id"] == _dis_id), None)
+        else:
+            self._today_disaster = None
+        self._disaster_price_mod = data.get("_disaster_price_mod", 1.0)
+        self._disaster_quality_mod = data.get("_disaster_quality_mod", 0)
+        self._disaster_bargain_bonus = data.get("_disaster_bargain_bonus", 0)
+        self._rare_boost_today = data.get("_rare_boost_today", False)
+        self._neighbor_conflict = data.get("_neighbor_conflict", False)
+        self._roof_leaking = data.get("_roof_leaking", False)
+        self._max_carry = data.get("_max_carry", 5)
+        self._last_stall = data.get("_last_stall", None)
+        self._journey_text = data.get("_journey_text", "")
+        self._journey_shown = data.get("_journey_shown", False)
+        self._stall_item_cache = data.get("_stall_item_cache", {})
+        self._season_stall_items = data.get("_season_stall_items", {})
         if self.mystic:
             self.mystic.load_state(data.get("mystic_state") or {})
         return True
