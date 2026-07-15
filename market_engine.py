@@ -192,7 +192,7 @@ class MarketGame:
 
     # ---- 存档 ----
 
-    SAVE_VERSION = 9
+    SAVE_VERSION = 10
 
     @staticmethod
     def _set_to_list(obj):
@@ -229,7 +229,30 @@ class MarketGame:
             return [MarketGame._restore_sets_in_ks(x) for x in obj]
         return obj
 
-    def save(self):
+    # ---- rng 状态持久化 ----
+    # mulberry32 是闭包：nonlocal seed 是它的内部状态。
+    # 存这个内部 seed = 存调用进度；load 用 mulberry32(state) 重建闭包即可接续。
+    # 否则每次新进程 load 都回到 mulberry32(seed) 起点，同一天菜价/品质/事件对不上。
+    def _get_rng_state(self):
+        try:
+            return self.rng.__closure__[0].cell_contents
+        except (IndexError, AttributeError):
+            return None
+
+    def _set_rng_state(self, state):
+        if state is not None:
+            self.rng = mulberry32(state)
+
+    def _trace_day(self, old_day, reason):
+        """day 变更追踪——写 stderr，帮定位"天数莫名跳变"。
+        正常只有 new_day 推进1天、mystic 时间循环回退1天会触发。
+        若日志里出现别的调用栈→就是 ghost bug。"""
+        import sys, traceback
+        caller = traceback.format_stack()[-2].strip().split("\n")[0]
+        print(f"[day-trace] {old_day}→{self.day} ({reason}) from {caller}", file=sys.stderr)
+
+    def to_dict(self):
+        """把当前状态导出成可JSON的dict——save和engine.py共用这一份逻辑。"""
         # basket: 去掉actual_yield（预处理副作用，load时重新算）
         basket_clean = []
         for item in self.basket:
@@ -298,7 +321,13 @@ class MarketGame:
             "rt_solar_term": getattr(self, '_today_solar_term', None),
             "savings": getattr(self, "savings", 0),
             "mystic_state": (self.mystic.state_for_save() if self.mystic else None),
+            "rt_rng_state": self._get_rng_state(),
+            "_last_opened_day": getattr(self, "_last_opened_day", None),
         }
+        return data
+
+    def save(self):
+        data = self.to_dict()
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -308,6 +337,11 @@ class MarketGame:
                 data = json.load(f)
         else:
             data = {}
+        return self.from_dict(data)
+
+    def from_dict(self, data):
+        """从dict装回self——load和engine.py共用这一份逻辑。
+        data可以是{}（新档）/旧版本dict/当前版本dict。"""
         # 版本迁移
         version = data.get("save_version", 1)
         if version < 2:
@@ -367,8 +401,20 @@ class MarketGame:
             data.setdefault("spent", 0)
             # stats里的冗余字段清掉——只保留纯统计
             data["save_version"] = 9
+        if version < 10:
+            # v9→v10: rng 调用进度持久化（rt_rng_state）
+            data.setdefault("rt_rng_state", None)
+            data["save_version"] = 10
         self.seed = data.get("seed", 0)
+        # 恢复 rng 调用进度——有存档则接续闭包内部状态，否则用 seed 起
+        # （None 时不能用 _set_rng_state——那是 no-op，会留 __init__ 的 mulberry32(0)）
+        _rng_state = data.get("rt_rng_state")
+        if _rng_state is not None:
+            self._set_rng_state(_rng_state)
+        else:
+            self.rng = mulberry32(self.seed)
         self.day = data.get("day", 0)
+        self._last_opened_day = data.get("_last_opened_day", None)
         self.fridge = data.get("fridge", [])
         self.basket = data.get("basket", [])
         # kitchen_state: list→set 还原
@@ -396,6 +442,16 @@ class MarketGame:
             "unique_dishes": set(data.get("stats_unique_dishes", [])),
             "unique_days": set(data.get("stats_unique_days", [])),
         }
+        # 这 4 个 save 存了、迁移 setdefault 了，但以前 load 没读回——跨进程全丢
+        # （affection/story_progress 是跨天持久的好感和剧情，丢了等于白玩；阿枭 P0）
+        self.unlocked_skills = data.get("unlocked_skills", [])
+        self.inspect_counts = data.get("inspect_counts", {
+            "绿叶": 0, "根茎": 0, "瓜果": 0, "豆类": 0,
+            "菌菇": 0, "豆制品": 0, "肉": 0, "鱼": 0, "蛋": 0, "调味": 0,
+            "scale": 0,
+        })
+        self.affection = data.get("affection", {})
+        self.story_progress = data.get("story_progress", [])
         self.wife_state = data.get("wife_state", "")
         self.palate = data.get("palate", {"dislikes": {}, "loves": {}, "fears": {}, "texture": {}})
         self._state_avoid = data.get("state_avoid", [])
@@ -434,8 +490,11 @@ class MarketGame:
 
     # ---- 新一局 ----
 
-    def new_day(self, seed=None):
-        """开始新的一局（一顿饭）"""
+    def new_day(self, seed=None, force=False):
+        """开始新的一局（一顿饭）
+
+        force=True 时跳过"今天已开局"防呆——给「新局 明天/强制」用。
+        """
         self.load()  # 先读存档
         if seed is not None:
             self.seed = seed
@@ -443,14 +502,27 @@ class MarketGame:
             self.seed = int(time.time()) & 0xFFFFFFFF
         self.rng = mulberry32(self.seed)
 
+        # ── 防呆：今天的局还没做完就不许再开新一天，免得反复调 new_day 跳天 ──
+        # _last_opened_day 记上次开局定型后的 day。若它等于当前 day 且上局未结束，
+        # 说明这天的饭还没端上桌又来开新局——拒绝，把存档原样读回。
+        if (getattr(self, "_last_opened_day", None) == self.day
+                and not self.done and not force):
+            self.load()  # 撤掉刚 mulberry32 的重置，恢复存档 rng
+            return (f"⏳ 今天（第{self.day}天）的局已经开过了，还没做完。"
+                    f"继续做完用「做/快做/端」，开明天用「新局 明天」强制。")
+
         _prev_day = self.day  # 神秘时空时间循环需知昨天、结转需知是否第一局
         self.day += 1
+        self._trace_day(_prev_day, "new_day推进")
         self.turn = 0
         # 神秘时空：时间循环回退——若昨天在异市做了标记交易，回退1天
         if self.mystic:
             loop_back, self._time_loop_narrative = self.mystic.maybe_time_loop(_prev_day)
             if loop_back:
                 self.day -= 1  # 回退1天
+                self._trace_day(_prev_day + 1, "mystic时间循环回退")
+        # 记录今天开局定型后的 day——给下回 new_day 防呆用
+        self._last_opened_day = self.day
         # 上局没做完——买的菜存进冰箱（保鲜0天的扔了）
         if not self.done and self.basket:
             for item in self.basket:
@@ -659,6 +731,13 @@ class MarketGame:
                 del self.storyline_state[vendor]
 
         # ── 节气事件 ──
+        # 先清昨天的节气修饰符——_solar_* 用 hasattr 守卫读，若不清，
+        # 同进程连开新局时昨天的会残留下一天（跨进程因不存档本会自清，这里补上同进程这条）。
+        for _attr in ("_solar_price_mod_all", "_solar_bargain_bonus",
+                      "_solar_quality_mod", "_solar_rare_mult",
+                      "_solar_price_mod", "_solar_quality_boost"):
+            if hasattr(self, _attr):
+                delattr(self, _attr)
         self._today_solar_term = self._check_solar_term()
         if self._today_solar_term:
             self._apply_solar_term_effects(self._today_solar_term)
@@ -2031,13 +2110,26 @@ class MarketGame:
                     else:
                         continue
                 else:
-                    # 有具体食材的菜谱：做法文本提到菜谱名关键词=高分，纯食材匹配=低分
+                    # 有具体食材的菜谱。
+                    # 食材是硬证据，菜名关键词是软提示——
+                    # 否则"先炒蛋盛出"会因含"炒蛋"两字被错认成"韭菜炒蛋"（家机撞过）。
+                    # 做法/手头共同构成"可用食材"
+                    usable = all_names | {ing for ing in ingredients if ing in approach_text}
+                    ing_hit = sum(1 for ing in ingredients if ing in usable)
+                    # 菜名证据：整名出现在做法里=强(玩家明说要做这道)；2字滑窗=弱
                     recipe_keys = [rname[i:i+2] for i in range(len(rname)-1)]
-                    key_match = any(k in approach_text for k in recipe_keys)
-                    if key_match:
-                        score = 100  # 做法文本明确提到菜名
+                    if rname in approach_text:
+                        name_score = 100
+                    elif any(k in approach_text for k in recipe_keys):
+                        name_score = 50
                     else:
-                        score = sum(1 for ing in ingredients if ing in all_names)
+                        name_score = 0
+                    # 综合分：食材覆盖为主，菜名为辅
+                    ing_score = int(ing_hit / max(1, len(ingredients)) * 100)
+                    score = max(ing_score, name_score)
+                    # 菜名弱命中(50)但食材一个都没对上——不能认，否则纯靠"炒蛋"撞名
+                    if name_score == 50 and ing_hit == 0:
+                        score = 0
                 if score > best_score:
                     best_score = score
                     best_match = rname
@@ -2838,6 +2930,7 @@ class MarketGame:
                 app_zh = {"great": "极好", "good": "不错", "ok": "一般", "bad": "不太行", "terrible": "砸了"}.get(prev_app, "一般")
                 lines.append(f"  {prev_name}（{prev_items}）{app_zh}")
             self.done = True
+            self._last_opened_day = None  # 今天的局做完了，解开封印，下回 new_day 不再挡
             self.save()
             lines.append("")
             lines.append(f"📖 {self.season} · {self.weather} | 第{self.day}天")
@@ -3136,6 +3229,7 @@ class MarketGame:
             lines.append(f"学到技巧：{len(ks['unlocked_prep'])}个")
 
         self.done = True
+        self._last_opened_day = None  # 今天的局做完了，解开封印，下回 new_day 不再挡
         self.plate = {"dish": dish_name, "appearance": appearance, "score": score}
 
         # 统计
@@ -5385,8 +5479,15 @@ class MarketGame:
                 results.append(self._cmd_single(part))
                 if i < len(parts) - 1:
                     results.append("")
+            # 多指令批量执行后落盘——防 buy/赠品跨进程丢（阿枭 P1）
+            self.save()
             return "\n".join(results)
-        return self._cmd_single(instruction)
+        result = self._cmd_single(instruction)
+        # 每条指令执行后落盘——幂等，save 存的是当前内存态。
+        # 防 buy/bargain/visit_stall/_buy_rare 等改了 basket/spent/affection 却不存档，
+        # 下个进程 load 全丢（家机撞过赠品黄瓜没入库）。
+        self.save()
+        return result
 
     def _cmd_single(self, instruction):
         """单条指令处理"""
@@ -5403,8 +5504,10 @@ class MarketGame:
             self.new_day()
 
         # 新局——需要明确的"新局"指令，防止AI误触
-        if instruction == "新局":
-            return self.new_day()
+        # 「新局 明天」「新局 强制」绕过"今天没做完"防呆
+        if instruction == "新局" or instruction.startswith("新局 "):
+            _force = instruction != "新局"  # 带后缀=强制开明天，绕防呆
+            return self.new_day(force=_force)
 
         # 神秘时空：「答 XXX」——回答鬼摊的问题，原话存档换 exotic 食材
         if instruction.startswith("答 ") and self.mystic:
@@ -5924,6 +6027,8 @@ class MarketGame:
         if tw:
             lines.append(tw)
         lines.append("📖 " + self._status_bar())
+        # 帮工可能往 basket 塞了赠品/改了好感/声望——立刻存档，免得跨进程丢（家机撞过黄瓜没入库）
+        self.save()
         return "\n".join(lines)
 
     def _visit_secret_area(self, area_id):
@@ -6038,7 +6143,7 @@ class MarketGame:
                     self.encyclopedia["recipes_unlocked"].add(rname)
                 if "item" in reward:
                     ri = reward["item"]
-                    self.basket.append({"name": ri["name"], "quality": ri.get("quality", "ok"), "qty": 1, "price": ri.get("price", 0), "stall": stall_id, "owner": STALL_BY_ID.get(stall_id, {}).get("owner", "摊主")})
+                    self.basket.append({"name": ri["name"], "quality": ri.get("quality", "ok"), "qty": 1, "price": ri.get("price", 0), "stall": stall_id, "owner": STALL_BY_ID.get(stall_id, {}).get("owner", "摊主"), "_free": True})
                     self.encyclopedia["items_bought"].add(ri["name"])
                 if "perk" in reward:
                     self._perks.add(reward["perk"])
@@ -6174,6 +6279,8 @@ class MarketGame:
         if self.fridge:
             lines.append(f"冰箱：{self._fridge_str()}")
         lines.append("📖 " + self._status_bar())
+        # 诊断行——帮定位"天数莫名跳变"：今日已开局/day、本局是否结束、rng内部状态、存档版本
+        lines.append(f"〔诊断〕今日已开局day={getattr(self,'_last_opened_day',None)} 本局done={self.done} rng={self._get_rng_state()} 存档v{self.SAVE_VERSION}")
         return "\n".join(lines)
 
     def _basket_detail(self):
