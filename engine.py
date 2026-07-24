@@ -26,7 +26,7 @@ AI接入方式:
 字段平铺本名（season/weather/basket/...），MCP status 直接读。
 """
 
-import sys, os, io, json, time
+import sys, os, io, json, time, logging
 
 # 确保UTF-8输出（Windows终端默认gbk会崩emoji）
 if sys.stdout.encoding != 'utf-8':
@@ -118,6 +118,9 @@ def cmd(state, instruction):
     return new_state, output
 
 
+_log = logging.getLogger("market_shim")
+
+
 def load_game():
     """从文件读存档。返回 state_dict 或 None。"""
     if not os.path.exists(_SAVE_FILE):
@@ -125,17 +128,18 @@ def load_game():
     try:
         with open(_SAVE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        _log.warning("load_game 失败: %s", e)
         return None
 
 
 def save_game(state):
-    """存档到文件。"""
+    """存档到文件。失败时打日志（不抛，避免打断游戏循环）。"""
     try:
         with open(_SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    except OSError as e:
+        _log.error("save_game 失败: %s", e)
 
 
 # ── 命令行入口 ──────────────────────────────────────

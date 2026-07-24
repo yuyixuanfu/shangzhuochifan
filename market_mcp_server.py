@@ -31,13 +31,25 @@
 
 import sys
 import os
-import io
 
-# UTF-8
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-if sys.stderr.encoding != 'utf-8':
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+# UTF-8 — 用 reconfigure 原地改编码，避免重新赋值 sys.stdout
+# （reassign 会让已缓存 stdout 引用的库输出错乱）
+def _ensure_utf8(stream):
+    if stream.encoding and stream.encoding.lower().replace('-', '') == 'utf8':
+        return
+    try:
+        stream.reconfigure(encoding='utf-8', errors='replace')  # Py3.7+
+    except (AttributeError, ValueError):
+        # stream 不支持 reconfigure（如被替换过）时回退到老办法
+        import io
+        wrapper = io.TextIOWrapper(stream.buffer, encoding='utf-8', errors='replace')
+        if stream is sys.stdout:
+            sys.stdout = wrapper
+        else:
+            sys.stderr = wrapper
+
+_ensure_utf8(sys.stdout)
+_ensure_utf8(sys.stderr)
 
 # 确保引擎目录在path里
 _HERE = os.path.dirname(os.path.abspath(__file__))

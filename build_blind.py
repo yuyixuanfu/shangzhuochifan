@@ -90,7 +90,7 @@ def new_game(seed=0x9E3779B9):
     # 统计
     raw_size = len(all_code.encode("utf-8"))
     blind_size = os.path.getsize(out_path)
-    print(f"✅ 生成 market_blind.py")
+    print(f"[OK] 生成 market_blind.py")
     print(f"   源码: {raw_size:,} 字节 → 盲玩版: {blind_size:,} 字节")
 
 if __name__ == "__main__":

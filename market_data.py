@@ -3158,6 +3158,11 @@ def get_affection_stage(affection):
 # ---- 预构建索引 ----
 STALL_BY_ID = {s["id"]: s for s in STALLS}
 for ws in WANDERING_STALLS:
+    if ws["id"] in STALL_BY_ID:
+        # 撞 id 意味着游商会静默盖掉固定摊位，开发期就该爆出来
+        raise ValueError(
+            f"WANDERING_STALLS id '{ws['id']}' 与已有固定摊位 id 冲突"
+        )
     STALL_BY_ID[ws["id"]] = ws
 
 ITEM_STALL_INDEX = {}

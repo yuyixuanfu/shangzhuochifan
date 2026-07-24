@@ -8,7 +8,6 @@
 
 import json
 import os
-import random
 import re
 import time
 
@@ -1023,7 +1022,12 @@ class MarketGame:
             area = SECRET_AREAS[aid]
             already_shown = any(a["id"] == aid for a in new_secrets)
             if not already_shown:
-                lines.append(f"  🚪 {area['name']}（{area['owner']}）— {len(area['sells'])}种")
+                count = len(area.get("sells", []))
+                if count == 0:
+                    # 特殊地点（如楼梯间小灶）没有商品，但仍要提示玩家已解锁
+                    lines.append(f"  🚪 {area['name']}（{area['owner']}）— 特殊地点")
+                else:
+                    lines.append(f"  🚪 {area['name']}（{area['owner']}）— {count}种")
 
         lines.append("")
         lines.append("用「去 摊位id」逛某个摊，如：去 veg_1")
@@ -5594,7 +5598,7 @@ class MarketGame:
             return f"⏪ 回退到第{self.day}天 · {self.season}（第{self._season_day}天）\n菜场和天气已刷新，输入'菜场'重新逛。"
 
         # 看菜场
-        if instruction in ("菜场", "看看", "逛逛", "市场"):
+        if instruction in ("菜场", "看看", "逛逛", "市场", "看菜场", "看市场", "逛菜场", "逛市场"):
             return self.look_stalls()
         # 模糊匹配分区
         if instruction.startswith("去 "):

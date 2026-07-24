@@ -10,10 +10,12 @@ def validate():
     from market_data import (
         VEGGIES, STALLS, WANDERING_STALLS, STORY_BEATS, CHOICE_CHAINS,
         AFFECTION_MILESTONES, SECRET_AREAS, STALL_RELATIONS, TIMED_ENCOUNTERS,
-        HIDDEN_RECIPES, RECIPE_DISCOVERIES, KITCHEN_ACCIDENTS, CUTTING_TRAP,
+        HIDDEN_RECIPES, KITCHEN_ACCIDENTS, CUTTING_TRAP,
         MARKET_DISASTERS, KEEP_DAYS, YIELD_PCT, FRAGILE_LEVEL,
         STALL_BY_ID, ITEM_STALL_INDEX,
     )
+    # TODO: market_data 里没有 RECIPE_DISCOVERIES（v1.0 起就一直缺失），
+    # 等数据层补上对应字段后再恢复下方的校验块。
     from market_recipes import RECIPES
 
     errors = []
@@ -49,10 +51,10 @@ def validate():
         for ing in rdata.get("ingredients", []):
             check_item(ing, f"隐藏菜谱「{rname}」")
 
-    # RECIPE_DISCOVERIES
-    for disc in RECIPE_DISCOVERIES:
-        for item in disc.get("items", set()):
-            check_item(item, f"配方发现「{disc.get('hint','?')[:20]}」")
+    # RECIPE_DISCOVERIES — 见上方 TODO，等数据补回后恢复
+    # for disc in RECIPE_DISCOVERIES:
+    #     for item in disc.get("items", set()):
+    #         check_item(item, f"配方发现「{disc.get('hint','?')[:20]}」")
 
     # CUTTING_TRAP
     for name in CUTTING_TRAP:
@@ -155,14 +157,14 @@ def validate():
     print()
 
     if errors:
-        print(f"❌ {len(errors)} 个错误：")
+        print(f"[ERR] {len(errors)} 个错误：")
         for e in errors:
-            print(f"  • {e}")
+            print(f"  - {e}")
     else:
-        print("✅ 0 错误")
+        print("[OK] 0 错误")
 
     if warns:
-        print(f"\n⚠ {len(warns)} 个警告（缺数据，会用默认值）：")
+        print(f"\n[WARN] {len(warns)} 个警告（缺数据，会用默认值）：")
         # 去重
         seen = set()
         for w in warns:
