@@ -71,7 +71,7 @@ def _status_bar(game):
     else:
         bar["phase"] = "吃完"
 
-    return json.dumps(bar, ensure_ascii=False, separators=(',', ':'))
+    return json.dumps(bar, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
 
 
 # ── 核心接口 ────────────────────────────────────────
@@ -137,7 +137,7 @@ def save_game(state):
     """存档到文件。失败时打日志（不抛，避免打断游戏循环）。"""
     try:
         with open(_SAVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+            json.dump(state, f, ensure_ascii=False, indent=2, allow_nan=False)
     except OSError as e:
         _log.error("save_game 失败: %s", e)
 

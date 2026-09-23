@@ -377,7 +377,7 @@ class MarketGame:
     def save(self):
         data = self.to_dict()
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
 
     def load(self):
         if os.path.exists(SAVE_FILE):
