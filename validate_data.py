@@ -22,8 +22,20 @@ def validate():
     warns = []
 
     # ── 1. 摊位ID ──
-    stall_ids = {s["id"] for s in STALLS}
-    wander_ids = {w["id"] for w in WANDERING_STALLS}
+    stall_ids = set()
+    for s in STALLS:
+        sid = s.get("id")
+        if not sid:
+            errors.append(f"STALLS 条目缺 id: {s.get('name', '?')}")
+            continue
+        stall_ids.add(sid)
+    wander_ids = set()
+    for w in WANDERING_STALLS:
+        wid = w.get("id")
+        if not wid:
+            errors.append(f"WANDERING_STALLS 条目缺 id: {w.get('name', '?')}")
+            continue
+        wander_ids.add(wid)
     all_stall_ids = stall_ids | wander_ids
 
     # STALL_BY_ID 一致性
@@ -70,32 +82,48 @@ def validate():
 
     # AFFECTION_MILESTONES
     for ms in AFFECTION_MILESTONES:
-        check_stall(ms["stall"], f"里程碑「{ms['id']}」")
+        ms_id = ms.get("id", "?")
+        ms_stall = ms.get("stall")
+        if not ms_stall:
+            errors.append(f"里程碑「{ms_id}」缺 stall 字段")
+            continue
+        check_stall(ms_stall, f"里程碑「{ms_id}」")
 
     # STORY_BEATS
     for story_id, beats in STORY_BEATS.items():
         for beat in beats:
             sid = beat.get("stall")
+            bid = beat.get("id", "?")
             if sid:
-                check_stall(sid, f"故事「{beat['id']}」")
+                check_stall(sid, f"故事「{bid}」")
 
     # CHOICE_CHAINS
     for chain_id, chain in CHOICE_CHAINS.items():
         for step in chain.get("steps", []):
-            sid = step.get("trigger", {}).get("stall")
+            trigger = step.get("trigger") or {}
+            sid = trigger.get("stall")
+            step_id = step.get("id", "?")
             if sid:
-                check_stall(sid, f"选择链「{step['id']}」")
+                check_stall(sid, f"选择链「{step_id}」")
 
     # STALL_RELATIONS
-    for rel in STALL_RELATIONS:
-        check_stall(rel["a"], f"摊主关系「{rel.get('relation','?')}」a")
-        check_stall(rel["b"], f"摊主关系「{rel.get('relation','?')}」b")
+    for i, rel in enumerate(STALL_RELATIONS):
+        rel_name = rel.get("relation", "?")
+        a = rel.get("a")
+        b = rel.get("b")
+        if not a or not b:
+            errors.append(f"STALL_RELATIONS[{i}] 缺 a/b: {rel_name}")
+            continue
+        check_stall(a, f"摊主关系「{rel_name}」a")
+        check_stall(b, f"摊主关系「{rel_name}」b")
 
     # TIMED_ENCOUNTERS
     for te in TIMED_ENCOUNTERS:
-        sid = te.get("condition", {}).get("stall")
+        te_id = te.get("id", "?")
+        condition = te.get("condition") or {}
+        sid = condition.get("stall")
         if sid:
-            check_stall(sid, f"限时奇遇「{te['id']}」")
+            check_stall(sid, f"限时奇遇「{te_id}」")
 
     # ── 4. 灾害分类 ──
     veggie_cats = {v.get("cat", "") for v in VEGGIES.values()}

@@ -85,7 +85,7 @@ try:
     section("3. 买 + per-stall milestone 折扣")
     g.cmd("去 veg_1")
     g.affection["veg_1"] = 0
-    STALL_BY_ID["veg_2"]["_discount"] = 0.0
+    g._stall_discounts = {}
 
     # 选个独特菜名——"韭菜"（不在 timed encounter free gift 候选范围）
     _testutil.reset()
@@ -118,7 +118,7 @@ try:
     g3.affection["veg_2"] = 25  # 触发 aff20 milestone
     g3.cmd("去 veg_2")
     g3.budget = 100
-    discount_val = STALL_BY_ID["veg_2"].get("_discount", 0)
+    discount_val = getattr(g3, "_stall_discounts", {}).get("veg_2", 0)
     check("aff20 milestone 触发后 discount>0", discount_val > 0,
           detail=f"_discount={discount_val}")
     paid_with_discount = None

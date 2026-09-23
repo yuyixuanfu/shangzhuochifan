@@ -368,6 +368,13 @@ class MarketGame:
             "_last_stall": getattr(self, "_last_stall", None),
             "_journey_text": getattr(self, "_journey_text", ""),
             "_journey_shown": getattr(self, "_journey_shown", False),
+            # 跨指令状态——不存则 stateless wrapper 每次丢
+            "_pending_chain_steps": getattr(self, "_pending_chain_steps", []),
+            "_pending_help": getattr(self, "_pending_help", None),
+            "_pending_interaction": getattr(self, "_pending_interaction", None),
+            "_pending_rare": getattr(self, "_pending_rare", None),
+            "_per_stall_ms_triggered": list(getattr(self, "_per_stall_ms_triggered", set())),
+            "_help_cooldown": getattr(self, "_help_cooldown", {}),
             # 缓存——能 lazy 重建，但存了省一次重算、也防跨进程抖动
             "_stall_item_cache": getattr(self, "_stall_item_cache", {}),
             "_season_stall_items": getattr(self, "_season_stall_items", {}),
@@ -376,23 +383,36 @@ class MarketGame:
 
     def save(self):
         data = self.to_dict()
-        with open(SAVE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
+        tmp = SAVE_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
+            os.replace(tmp, SAVE_FILE)
+        except (OSError, PermissionError):
+            # Windows 上 os.replace 可能被杀毒/索引锁挡住——回退直接写
+            with open(SAVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     def load(self):
         if os.path.exists(SAVE_FILE):
             try:
                 with open(SAVE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                # 存档损坏（用户手动改坏了 / 写一半断电 / 编码错位），
-                # 静默当成新档处理，避免游戏卡死打不开。
-                # 删掉坏档免得每次 load 都报错。
+            except json.JSONDecodeError:
+                # 存档损坏——改名保留而非删除，给用户恢复的机会
+                backup = SAVE_FILE + ".corrupt"
                 try:
-                    os.remove(SAVE_FILE)
+                    os.replace(SAVE_FILE, backup)
                 except OSError:
                     pass
                 data = {}
+            except OSError:
+                # IO 错误（权限/磁盘）——不碰文件，也不当成新档
+                raise
         else:
             data = {}
         return self.from_dict(data)
@@ -573,6 +593,12 @@ class MarketGame:
         self._last_stall = data.get("_last_stall", None)
         self._journey_text = data.get("_journey_text", "")
         self._journey_shown = data.get("_journey_shown", False)
+        self._pending_chain_steps = data.get("_pending_chain_steps", [])
+        self._pending_help = data.get("_pending_help", None)
+        self._pending_interaction = data.get("_pending_interaction", None)
+        self._pending_rare = data.get("_pending_rare", None)
+        self._per_stall_ms_triggered = set(data.get("_per_stall_ms_triggered", []))
+        self._help_cooldown = data.get("_help_cooldown", {})
         self._stall_item_cache = data.get("_stall_item_cache", {})
         self._season_stall_items = data.get("_season_stall_items", {})
         if self.mystic:
@@ -665,7 +691,7 @@ class MarketGame:
             # 旧版用 round(leftover/2, 1) 是银行家舍入（round half to even）：
             # leftover=0.1 时 carry=0.0（0.05 舍到偶数 0），jar 拿全部，破坏"一半对一半"。
             # 改用 round half up 等价：先把 leftover 放大 10 倍 round（普通舍入），再除回。
-            carry = round(leftover * 10 / 2) / 10
+            carry = int(leftover * 10 / 2 + 0.5) / 10
             jar_add = round((leftover - carry) * 10) / 10
             self.savings = round(self.savings + jar_add, 1)
         else:
@@ -734,12 +760,12 @@ class MarketGame:
                     out.add(vname)
             available = [v for v in items if v not in out]
             if not available and items:
-                out.discard(items[int(self.rng() * len(items)) % len(items)])
+                out.discard(items[self.rng() % len(items)])
             if out:
                 self.sold_out[sid] = out
 
         pool = JOURNEY_TEXT.get(self.weather, JOURNEY_TEXT["晴"])
-        self._journey_text = pool[int(self.rng() * len(pool)) % len(pool)]
+        self._journey_text = pool[self.rng() % len(pool)]
         self._journey_shown = False
 
         self.unlocked_skills = []       # 已解锁技能id
@@ -1635,11 +1661,15 @@ class MarketGame:
         elif self.current_stall:
             stall = self._find_stall(self.current_stall)
             # 当前摊不卖这个——不能凭空从别的摊买，得先去
-            if stall and item_name not in stall.get("sells", []):
-                other = self._find_stall_selling(item_name)
-                if other:
-                    return f"这个摊不卖{item_name}。去{other['name']}（{other['id']}）看看？"
-                return f"今天没看到卖{item_name}的摊。"
+            if stall:
+                _sells = stall.get("sells", [])
+                if isinstance(_sells, dict):
+                    _sells = _sells.get(self.season, []) or []
+                if item_name not in _sells:
+                    other = self._find_stall_selling(item_name)
+                    if other:
+                        return f"这个摊不卖{item_name}。去{other['name']}（{other['id']}）看看？"
+                    return f"今天没看到卖{item_name}的摊。"
         else:
             stall = self._find_stall_selling(item_name)
         if not stall:
@@ -1702,7 +1732,7 @@ class MarketGame:
         price = base_price + weight_extra + unit_extra
 
         # per-stall milestone 的折扣（aff20+ 触发：抹零头 3-5%）
-        discount = stall.get("_discount", 0)
+        discount = getattr(self, "_stall_discounts", {}).get(stall.get("id", ""), 0)
         if discount:
             price = round(price * (1 - discount), 1)
 
@@ -1858,8 +1888,12 @@ class MarketGame:
             stall = self._find_stall(stall_id)
         elif self.current_stall:
             stall = self._find_stall(self.current_stall)
-            if stall and item_name not in stall.get("sells", []):
-                stall = self._find_stall_selling(item_name)
+            if stall:
+                _sells2 = stall.get("sells", [])
+                if isinstance(_sells2, dict):
+                    _sells2 = _sells2.get(self.season, []) or []
+                if item_name not in _sells2:
+                    stall = self._find_stall_selling(item_name)
         else:
             stall = self._find_stall_selling(item_name)
         if not stall:
@@ -3163,6 +3197,26 @@ class MarketGame:
             bonus = HIDDEN_RECIPES[dish_name].get("bonus_score", 3)
             score += bonus
 
+        # 食材搭配刚需扣分 + 遗漏步骤扣分——必须在 appearance 判定之前
+        pot_contents = set(ks.get("pot_contents", []))
+        seasoning = set(ks.get("seasoning", []))
+        used_stuff = pot_contents | seasoning
+        pairing_rules = [
+            ("鲫鱼", "姜", "鱼没配姜，腥味去不干净"),
+            ("草鱼", "姜", "鱼没配姜，腥味去不干净"),
+            ("鲈鱼", "姜", "鱼没配姜，腥味去不干净"),
+            ("五花肉", "葱", "肉没配葱，腥气重"),
+            ("瘦猪肉", "姜", "肉没配姜，有点腥"),
+            ("豆腐", "葱", "豆腐没配葱，少了点香"),
+        ]
+        pairing_msgs = []
+        for main_item, needed, msg in pairing_rules:
+            if main_item in pot_contents and needed not in used_stuff:
+                score -= 3
+                pairing_msgs.append(msg)
+        if missed:
+            score -= len(missed) * 2
+
         # 品相
         if score >= 10:
             appearance = "great"
@@ -3192,7 +3246,7 @@ class MarketGame:
         lines.append(f"──── {dish_name} ────")
         lines.append(appear_desc)
         drama_pool = SERVE_DRAMA.get(appearance, SERVE_DRAMA["ok"])
-        lines.append(drama_pool[int(self.rng() * len(drama_pool)) % len(drama_pool)])
+        lines.append(drama_pool[self.rng() % len(drama_pool)])
 
         # 之前盛出的菜也一起端上来
         if ks.get("completed_dishes"):
@@ -3209,6 +3263,9 @@ class MarketGame:
 
         # 算用了哪些食材
         used_names = set(ks["pot_contents"])
+        used_names.update(h.get("name") for h in ks.get("held_items", []))
+        for pd in ks.get("completed_dishes", []):
+            used_names.update(pd.get("items", []))
 
         # ── 叙事段落：这盘菜是怎么来的 ──
         journey_parts = []
@@ -3294,22 +3351,9 @@ class MarketGame:
         if taste_notes:
             lines.append("｜" + " ｜".join(taste_notes) + "｜")
 
-        # 食材搭配刚需——做鱼/肉时没用配菜扣分
-        pot_contents = set(ks.get("pot_contents", []))
-        seasoning = set(ks.get("seasoning", []))
-        used_stuff = pot_contents | seasoning
-        pairing_rules = [
-            ("鲫鱼", "姜", "鱼没配姜，腥味去不干净"),
-            ("草鱼", "姜", "鱼没配姜，腥味去不干净"),
-            ("鲈鱼", "姜", "鱼没配姜，腥味去不干净"),
-            ("五花肉", "葱", "肉没配葱，腥气重"),
-            ("瘦猪肉", "姜", "肉没配姜，有点腥"),
-            ("豆腐", "葱", "豆腐没配葱，少了点香"),
-        ]
-        for main_item, needed, msg in pairing_rules:
-            if main_item in pot_contents and needed not in used_stuff:
-                score -= 3
-                lines.append(f"⚠ {msg}")
+        # 食材搭配刚需——显示（扣分已在 appearance 判定前完成）
+        for msg in pairing_msgs:
+            lines.append(f"⚠ {msg}")
 
         # 食材品质汇总——一行，不替人评价
         quality_summary = []
@@ -3322,7 +3366,6 @@ class MarketGame:
 
         if missed:
             lines.append(f"⚠ 遗漏步骤：{'、'.join(s['name'] for s in missed)}")
-            score -= len(missed) * 2
         # 做菜回忆——带出品相和她说的话
         if cook_count >= 2:
             recall_parts = [f"做过{cook_count}次了"]
@@ -3689,8 +3732,8 @@ class MarketGame:
         _seasoning = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱"}
         cookable = [n for n in ks.get("pot_contents", []) if n not in _seasoning]
 
-        # 冷却：同一时刻不连续触发
-        if "last_moment" in ks and ks["last_moment"]:
+        # 冷却：同一时刻不连续触发（pop 消费标志，否则永远回不来）
+        if ks.pop("last_moment", False):
             return None
 
         moment = None
@@ -3745,10 +3788,7 @@ class MarketGame:
                     break
 
         # 设置冷却（下一步后才可能再触发）
-        if moment:
-            ks["last_moment"] = True
-        else:
-            ks["last_moment"] = False
+        ks["last_moment"] = bool(moment)
 
         return moment
 
@@ -3935,7 +3975,8 @@ class MarketGame:
         stall_ids = ITEM_STALL_INDEX.get(item_name, [])
         if not stall_ids:
             return None
-        return STALL_BY_ID[stall_ids[self.rng() % len(stall_ids)]]
+        sid = stall_ids[self.rng() % len(stall_ids)]
+        return STALL_BY_ID.get(sid)
 
     def _find_wandering_stall(self, stall_id):
         """找流动摊"""
@@ -6344,6 +6385,10 @@ class MarketGame:
                 self.unlocked_milestones.add(ms["id"])
                 self.encyclopedia["milestones_triggered"].add(ms["id"])
                 newly_triggered.append(ms)
+                # 同步标记到 _per_stall_ms_triggered，防止 per-stall 路径重复发奖
+                if not hasattr(self, "_per_stall_ms_triggered"):
+                    self._per_stall_ms_triggered = set()
+                self._per_stall_ms_triggered.add((stall_id, ms.get("affection")))
                 reward = ms.get("reward", {})
                 if "recipe" in reward:
                     rname = reward["recipe"]
@@ -6389,15 +6434,16 @@ class MarketGame:
             # 不同 reward 类型用不同 key：
             # discount/perk 用 "value"；free_item 用 "item"；recipe 用 "recipe"
             # 统一映射到 item_name 给 free_item 用
-            item_name = reward.get("item") or reward.get("value")
+            item_name = reward.get("item") or reward.get("value") or reward.get("recipe")
             rdesc = reward.get("desc", "摊主给了你一份心意")
             # 只处理安全的 reward 类型；其他先标触发但不执行动作
             if rtype == "discount":
-                # 抹零头 / 折扣：把折扣值记到 stall._discount 里，买菜时用
-                if not hasattr(stall, "_discount"):
-                    stall["_discount"] = 0.0
-                if rvalue and rvalue > stall["_discount"]:
-                    stall["_discount"] = rvalue
+                # 折扣记到 self 侧，不写模块级 STALL_BY_ID（跨局泄漏）
+                if not hasattr(self, "_stall_discounts"):
+                    self._stall_discounts = {}
+                cur = self._stall_discounts.get(stall_id, 0.0)
+                if rvalue and rvalue > cur:
+                    self._stall_discounts[stall_id] = rvalue
             elif rtype == "free_item":
                 # 免费给一样东西（用 item key 取食材名）
                 if item_name and item_name in VEGGIES:
@@ -6467,15 +6513,15 @@ class MarketGame:
                 if reward.get("random_quality_item"):
                     candidates = [n for n, v in VEGGIES.items() if not v.get("_secret")]
                     if candidates:
-                        gift_name = candidates[int(self.rng() * len(candidates)) % len(candidates)]
+                        gift_name = candidates[self.rng() % len(candidates)]
                         self.basket.append({"name": gift_name, "quality": "great", "qty": 1, "price": 0, "stall": "gift", "owner": "摊主", "_free": True})
                         self.encyclopedia["items_bought"].add(gift_name)
                 if reward.get("free_quality_item"):
                     cats = ["绿叶", "瓜果", "根茎"]
-                    cat = cats[int(self.rng() * len(cats)) % len(cats)]
+                    cat = cats[self.rng() % len(cats)]
                     candidates = [n for n, v in VEGGIES.items() if v.get("cat") == cat and not v.get("_secret")]
                     if candidates:
-                        gift_name = candidates[int(self.rng() * len(candidates)) % len(candidates)]
+                        gift_name = candidates[self.rng() % len(candidates)]
                         # _free=True 让 buy() 的"已经买了"检查能识别这是赠送的、
                         # 不阻挡玩家主动再买一份（之前漏标，撞 buy 报"已经买了"）
                         self.basket.append({"name": gift_name, "quality": "great", "qty": 1, "price": 0, "stall": "found", "owner": "", "_free": True})

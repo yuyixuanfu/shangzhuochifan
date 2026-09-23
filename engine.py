@@ -39,7 +39,7 @@ except NameError:
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-_SAVE_FILE = os.path.join(_HERE, "market_save.json")
+_SAVE_FILE = os.environ.get("MARKET_SAVE_FILE") or os.path.join(_HERE, "market_save.json")
 
 
 def _new_game():
@@ -121,25 +121,42 @@ def cmd(state, instruction):
 _log = logging.getLogger("market_shim")
 
 
+class LoadResult:
+    """三态加载结果：ok / missing / corrupt。"""
+    def __init__(self, status, state=None, error=None):
+        self.status = status   # "ok" | "missing" | "corrupt"
+        self.state = state
+        self.error = error
+
+
 def load_game():
-    """从文件读存档。返回 state_dict 或 None。"""
+    """从文件读存档。返回 LoadResult（区分 ok/missing/corrupt）。"""
     if not os.path.exists(_SAVE_FILE):
-        return None
+        return LoadResult("missing")
     try:
         with open(_SAVE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        _log.warning("load_game 失败: %s", e)
-        return None
+            return LoadResult("ok", json.load(f))
+    except json.JSONDecodeError as e:
+        _log.warning("load_game 存档损坏: %s", e)
+        return LoadResult("corrupt", error=str(e))
+    except OSError as e:
+        _log.error("load_game IO错误: %s", e)
+        return LoadResult("corrupt", error=str(e))
 
 
 def save_game(state):
-    """存档到文件。失败时打日志（不抛，避免打断游戏循环）。"""
+    """原子写存档。失败时打日志（不抛，避免打断游戏循环）。"""
+    tmp = _SAVE_FILE + ".tmp"
     try:
-        with open(_SAVE_FILE, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2, allow_nan=False)
-    except OSError as e:
+        os.replace(tmp, _SAVE_FILE)
+    except (OSError, TypeError, ValueError) as e:
         _log.error("save_game 失败: %s", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ── 命令行入口 ──────────────────────────────────────
@@ -167,15 +184,28 @@ def main():
         return
 
     # 读存档
-    state = load_game()
-    if state is None:
+    result = load_game()
+    if result.status == "missing":
         state, text = new_game()
         save_game(state)
         print(text)
         print("\n（自动开新局。输入 python engine.py \"菜场\" 开始。）")
         return
+    elif result.status == "corrupt":
+        # 损坏档不覆盖——提示用户先备份
+        backup = _SAVE_FILE + ".corrupt"
+        if os.path.exists(_SAVE_FILE):
+            try:
+                os.replace(_SAVE_FILE, backup)
+            except OSError:
+                pass
+        print(f"存档损坏，已备份到 {backup}")
+        state, text = new_game()
+        save_game(state)
+        print(text)
+        return
 
-    # 执行
+    state = result.state
     new_state, text = cmd(state, instruction)
     save_game(new_state)
     print(text)
@@ -242,7 +272,7 @@ def _serve():
 
     port = int(os.environ.get("MARKET_PORT", 8877))
     print(f"上桌吃饭 HTTP API — localhost:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="127.0.0.1", port=port, debug=False)
 
 
 if __name__ == "__main__":

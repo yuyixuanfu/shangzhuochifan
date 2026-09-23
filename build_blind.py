@@ -8,6 +8,7 @@ AI 玩家看不到鱼谱、概率、坑点机制，只能靠玩发现。
 """
 
 import base64
+import hashlib
 import os
 import sys
 
@@ -35,7 +36,9 @@ def build():
         chunks.append(f"# === FILE: {fname} ===\n{code}")
 
     all_code = "\n\n".join(chunks)
-    encoded = base64.b64encode(all_code.encode("utf-8")).decode("ascii")
+    code_bytes = all_code.encode("utf-8")
+    digest = hashlib.sha256(code_bytes).hexdigest()
+    encoded = base64.b64encode(code_bytes).decode("ascii")
 
     # 生成盲玩版
     blind_code = f'''"""
@@ -52,14 +55,20 @@ AI 不知道有哪些坑、概率多少、暗坑怎么触发，
 """
 
 import base64 as _b64
+import hashlib as _hashlib
 import types as _types
 import sys as _sys
 
 _BLOB = "{encoded}"
+_SHA256 = "{digest}"
 
 def _load_engine():
-    """解码并执行引擎代码，返回模块"""
-    code = _b64.b64decode(_BLOB).decode("utf-8")
+    """解码并执行引擎代码，返回模块（带完整性校验）"""
+    code_bytes = _b64.b64decode(_BLOB, validate=True)
+    actual = _hashlib.sha256(code_bytes).hexdigest()
+    if actual != _SHA256:
+        raise RuntimeError(f"market_blind 完整性校验失败: expected {_SHA256}, got {{actual}}")
+    code = code_bytes.decode("utf-8")
     mod = _types.ModuleType("market_engine_internal")
     exec(compile(code, "market_engine_internal", "exec"), mod.__dict__)
     return mod
@@ -91,7 +100,8 @@ def new_game(seed=0x9E3779B9):
     raw_size = len(all_code.encode("utf-8"))
     blind_size = os.path.getsize(out_path)
     print(f"[OK] 生成 market_blind.py")
-    print(f"   源码: {raw_size:,} 字节 → 盲玩版: {blind_size:,} 字节")
+    print(f"   源码: {raw_size:,} 字节 -> 盲玩版: {blind_size:,} 字节")
+    print(f"   SHA-256: {digest}")
 
 if __name__ == "__main__":
     build()

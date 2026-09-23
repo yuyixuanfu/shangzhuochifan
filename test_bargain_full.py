@@ -174,7 +174,7 @@ g.cmd("去 veg_1")
 g.affection["veg_1"] = 80  # 一次过 3 个 milestone
 g.cmd("去 veg_1")  # fire all
 # 应该 discount + free_item + recipe
-discount = STALL_BY_ID["veg_1"].get("_discount", 0)
+discount = getattr(g, "_stall_discounts", {}).get("veg_1", 0)
 check("aff80 milestone discount 设上", discount > 0,
       detail=f"discount={discount}")
 # basket 应有 free_item (香菜) + recipe 解锁
