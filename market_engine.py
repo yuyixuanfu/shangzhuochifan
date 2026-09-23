@@ -399,7 +399,8 @@ class MarketGame:
 
     def from_dict(self, data):
         """从dict装回self——load和engine.py共用这一份逻辑。
-        data可以是{}（新档）/None（旧档被删/第一次load）/旧版本dict/当前版本dict。"""
+        data可以是{}（新档）/None（旧档被删/第一次load）/旧版本dict/当前版本dict。
+        注意：会修改 data（补默认值做版本迁移），调用方持有的引用会看到变化（FLOW-04 已文档化）。"""
         # 兼容 None：当作空档（新游戏 + 第一次 load）
         if data is None:
             data = {}
@@ -1111,7 +1112,7 @@ class MarketGame:
                     if effect.get("affection"):
                         self._change_affection(stall_id, effect["affection"])
                     # 非affection效果存为临时标记，买/砍价时读取
-                    if effect.get("price_mod") or effect.get("quality_mod") or effect.get("bargain_mod"):
+                    if any(k in effect for k in ("price_mod", "quality_mod", "bargain_mod")):
                         if not hasattr(self, '_storyline_effects'):
                             self._storyline_effects = {}
                         self._storyline_effects[stall_id] = {
@@ -1138,7 +1139,7 @@ class MarketGame:
         effect = day_data.get("effect", {})
         if effect.get("affection"):
             self._change_affection(stall_id, effect["affection"])
-        if effect.get("price_mod") or effect.get("quality_mod") or effect.get("bargain_mod"):
+        if any(k in effect for k in ("price_mod", "quality_mod", "bargain_mod")):
             if not hasattr(self, '_storyline_effects'):
                 self._storyline_effects = {}
             self._storyline_effects[stall_id] = {
@@ -3554,7 +3555,8 @@ class MarketGame:
         return stage_data["stages"][idx]
 
     def _progress_doneness(self, ks, step_text):
-        """根据火候和时间推进所有食材熟度"""
+        """根据火候和时间推进所有食材熟度。
+        注意：ks 是 self.kitchen_state 的引用，本函数直接修改它（FLOW-04 已文档化）。"""
         if ks["heat"] < 1:
             return []
         observations = []
@@ -3682,7 +3684,8 @@ class MarketGame:
         return "\n".join(lines)
 
     def _check_kitchen_moment(self, ks, step_text=""):
-        """厨房时刻——锅里出了状况，需要你判断。返回提示文字或None"""
+        """厨房时刻——锅里出了状况，需要你判断。返回提示文字或None。
+        注意：ks 是 self.kitchen_state 的引用，本函数直接修改它（FLOW-04 已文档化）。"""
         _seasoning = {"盐", "酱油", "醋", "糖", "料酒", "淀粉", "油", "水", "大葱"}
         cookable = [n for n in ks.get("pot_contents", []) if n not in _seasoning]
 

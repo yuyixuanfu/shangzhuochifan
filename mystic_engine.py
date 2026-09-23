@@ -348,6 +348,8 @@ class MysticLayer:
         return copy.deepcopy(self.state)
 
     def load_state(self, data):
+        """从 dict 恢复 mystic 状态。
+        注意：会修改 data（补默认值），调用方持有的引用会看到变化（FLOW-04 已文档化）。"""
         if not data:
             return
         # 合并，旧档缺字段补默认
