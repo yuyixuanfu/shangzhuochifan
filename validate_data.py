@@ -22,12 +22,16 @@ def validate():
     warns = []
 
     # ── 1. 摊位ID ──
+    # P1-31：add 前查重——STALL_BY_ID 是字典推导，重复 id 时后者静默覆盖前者，
+    # 这是引用检查查不到的最典型数据错误
     stall_ids = set()
     for s in STALLS:
         sid = s.get("id")
         if not sid:
             errors.append(f"STALLS 条目缺 id: {s.get('name', '?')}")
             continue
+        if sid in stall_ids:
+            errors.append(f"STALLS 重复 id: {sid}（后者覆盖前者）")
         stall_ids.add(sid)
     wander_ids = set()
     for w in WANDERING_STALLS:
@@ -35,8 +39,16 @@ def validate():
         if not wid:
             errors.append(f"WANDERING_STALLS 条目缺 id: {w.get('name', '?')}")
             continue
+        if wid in wander_ids:
+            errors.append(f"WANDERING_STALLS 重复 id: {wid}（后者覆盖前者）")
         wander_ids.add(wid)
     all_stall_ids = stall_ids | wander_ids
+
+    # MARKET_DISASTERS 的 id 存在性（P0-10：与摊位检查对齐，
+    # 否则第 4 节直接 d['id'] 下标会在脏数据上崩）
+    for d in MARKET_DISASTERS:
+        if not d.get("id"):
+            errors.append(f"MARKET_DISASTERS 条目缺 id: {d.get('name', '?')}")
 
     # STALL_BY_ID 一致性
     for sid in STALL_BY_ID:
@@ -130,35 +142,34 @@ def validate():
     for d in MARKET_DISASTERS:
         for cat in d.get("effects", {}).get("closed_cats", []):
             if cat not in veggie_cats:
-                errors.append(f"灾害「{d['id']}」closed_cats 里的「{cat}」不在 VEGGIES 分类中")
+                # P0-10：.get('id','?')——脏数据来了也要把报告打完整
+                errors.append(f"灾害「{d.get('id', '?')}」closed_cats 里的「{cat}」不在 VEGGIES 分类中")
 
     # ── 5. sells格式 ──
-    for stall in STALLS:
-        sells = stall.get("sells", [])
+    def _check_sells_items(owner_label, sells):
+        """摊位 sells 的统一校验：dict（按季）/list/其他类型。"""
         if isinstance(sells, dict):
-            # 流动摊的dict格式——检查每季的食材
             for season, items in sells.items():
+                # 值必须是可迭代的集合类型——误写成字符串会按字符逐个比对出垃圾错误
+                if not isinstance(items, (list, tuple, set)):
+                    errors.append(f"{owner_label} sells.{season} 类型异常: {type(items)}（应为列表）")
+                    continue
                 for item in items:
                     if item not in VEGGIES:
-                        errors.append(f"摊位「{stall['id']}」sells.{season} 里的「{item}」不在 VEGGIES")
+                        errors.append(f"{owner_label} sells.{season} 里的「{item}」不在 VEGGIES")
         elif isinstance(sells, list):
             for item in sells:
                 if item not in VEGGIES:
-                    errors.append(f"摊位「{stall['id']}」sells 里的「{item}」不在 VEGGIES")
+                    errors.append(f"{owner_label} sells 里的「{item}」不在 VEGGIES")
         else:
-            errors.append(f"摊位「{stall['id']}」sells 类型异常: {type(sells)}")
+            errors.append(f"{owner_label} sells 类型异常: {type(sells)}")
+
+    for stall in STALLS:
+        _check_sells_items(f"摊位「{stall.get('id', '?')}」", stall.get("sells", []))
 
     for ws in WANDERING_STALLS:
-        sells = ws.get("sells", [])
-        if isinstance(sells, dict):
-            for season, items in sells.items():
-                for item in items:
-                    if item not in VEGGIES:
-                        errors.append(f"流动摊「{ws['id']}」sells.{season} 里的「{item}」不在 VEGGIES")
-        elif isinstance(sells, list):
-            for item in sells:
-                if item not in VEGGIES:
-                    errors.append(f"流动摊「{ws['id']}」sells 里的「{item}」不在 VEGGIES")
+        # P1-33：与 STALLS 分支对齐——补 else 类型异常兜底，脏数据不再漏检
+        _check_sells_items(f"流动摊「{ws.get('id', '?')}」", ws.get("sells", []))
 
     # ── 6. 补全数据缺失（警告） ──
     all_item_names = set(VEGGIES.keys())
@@ -171,12 +182,24 @@ def validate():
             warns.append(f"FRAGILE_LEVEL 缺: {name}")
 
     # ── 7. ITEM_STALL_INDEX 一致性 ──
+    # P1-30：SECRET_AREAS 的 id 与专属食材也是合法引用——market_data 构建
+    # ITEM_STALL_INDEX 时收录了秘境摊，不纳入合法集会把真数据报成假警告，
+    # WARN 通道被假阳性灌满后真正的缺数据警告反而没人看了
+    secret_ids = set(SECRET_AREAS.keys()) if isinstance(SECRET_AREAS, dict) else set()
+    legal_stall_ids = all_stall_ids | secret_ids
+    secret_items = set()
+    if isinstance(SECRET_AREAS, dict):
+        for s in SECRET_AREAS.values():
+            sells = s.get("sells", []) if isinstance(s, dict) else []
+            if isinstance(sells, list):
+                secret_items.update(sells)
+
     for item_name, stall_refs in ITEM_STALL_INDEX.items():
-        if item_name not in VEGGIES:
+        if item_name not in VEGGIES and item_name not in secret_items:
             warns.append(f"ITEM_STALL_INDEX 引用不存在的食材: {item_name}")
         stall_list = stall_refs if isinstance(stall_refs, list) else [stall_refs]
         for sid in stall_list:
-            if sid not in all_stall_ids:
+            if sid not in legal_stall_ids:
                 warns.append(f"ITEM_STALL_INDEX 引用不存在的摊位: {sid}")
 
     # ── 报告 ──
@@ -193,10 +216,11 @@ def validate():
 
     if warns:
         print(f"\n[WARN] {len(warns)} 个警告（缺数据，会用默认值）：")
-        # 去重
+        # 按类别前缀去重（P1-34：原写法把整条消息拼回 key，永远不命中，
+        # 去重实际不生效；多条目消息还会被 ": " 截断误合并）
         seen = set()
         for w in warns:
-            key = w.split(": ")[0] + ": " + w.split(": ")[1] if ": " in w else w
+            key = w.split(":")[0].strip()
             if key not in seen:
                 seen.add(key)
                 print(f"  • {w}")
@@ -206,4 +230,6 @@ def validate():
 
 if __name__ == "__main__":
     n = validate()
-    sys.exit(n)
+    # P1-32：退出码布尔化——POSIX 只保留低 8 位，错误数恰好 256/512…
+    # 时 sys.exit(n) 会回绕成 0，CI 会把校验失败误判为通过
+    sys.exit(1 if n > 0 else 0)

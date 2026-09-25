@@ -9,7 +9,9 @@
 
 # ---- 异宾摊 ----
 # 仿 WANDERING_STALLS 结构，但 sells 是"非物质菜单"
-# MYSTIC_STALLS: {id, name, owner, personality, desc, message, trades, reveal_lines}
+# P1-26：实际 schema 为 {id, name, owner, personality, desc, message,
+#   greet, trades, gives, exotic_tag}——注释里旧写的 reveal_lines 字段
+# 从未存在，揭穿文案按 exotic_tag 在下方 MYSTIC_REVEALS 里查
 MYSTIC_STALLS = [
     {
         "id": "mystic_ghost_fish",

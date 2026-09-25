@@ -207,7 +207,17 @@ class MarketGame:
         self._journey_shown = False
         self._today_solar_term = None  # 当天节气事件
         self.storyline_state = {}  # {vendor_name: {"arc": arc_name, "day": day_num}}
-        # 神秘时空层
+        # P1-16：这些原来只在 from_dict 里初始化——绕过 new_day()/load() 直接
+        # 实例化后，look_stalls→_check_secret_unlocks（unlocked_secrets）、
+        # go_home（unlocked_hidden_recipes）、_burn_threshold（player_skills）
+        # 等处会 AttributeError。与紧邻注释的意图对齐：__init__ 统一补默认值
+        self.unlocked_secrets = set()
+        self.unlocked_milestones = set()
+        self.unlocked_hidden_recipes = set()
+        self.owner_memory = {}
+        self.player_skills = {"刀工": 0, "火候": 0, "识货": 0}
+        self.dish_feedback = {}
+        self.dish_history = {}
         self.mystic = MysticLayer(self) if MysticLayer else None
         self.in_mystic = False
         self.savings = 0  # 攒钱罐——昨天剩的一半存进来，跨天保存
@@ -378,12 +388,26 @@ class MarketGame:
             # 缓存——能 lazy 重建，但存了省一次重算、也防跨进程抖动
             "_stall_item_cache": getattr(self, "_stall_item_cache", {}),
             "_season_stall_items": getattr(self, "_season_stall_items", {}),
+            # P1-12：当日/长期运行时状态——不存则 stateless wrapper 重载后
+            # 雨天加价/抹零折扣/剧情修正/聊天冷却/稀有去重 全部静默失效
+            "_weather_price_mod": getattr(self, "_weather_price_mod", 1.0),
+            "_stall_discounts": getattr(self, "_stall_discounts", {}),
+            "_storyline_effects": getattr(self, "_storyline_effects", {}),
+            "_daily_chat_gain": sorted(getattr(self, "_daily_chat_gain", set()) or set()),
+            "_rare_found": [k[len("_rare_found_"):] for k in vars(self) if k.startswith("_rare_found_")],
         }
         return data
 
     def save(self):
+        # P0-2：HTTP 多会话模式（engine._serve 设 MARKET_SAVE_DISABLE）下
+        # 进度由进程内存持有——内部再无条件落盘的话，两个 session（或 HTTP
+        # 与 CLI）交替执行会互相覆盖 market_save.json
+        if os.environ.get("MARKET_SAVE_DISABLE"):
+            return
         data = self.to_dict()
-        tmp = SAVE_FILE + ".tmp"
+        # P1-6：tmp 名带 pid——固定 .tmp 会被 CLI/--serve/多进程并发写入者
+        # 互相换走，json.dump 交叉写入后 os.replace 原子提升的就是脏数据
+        tmp = f"{SAVE_FILE}.{os.getpid()}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
@@ -597,10 +621,25 @@ class MarketGame:
         self._pending_help = data.get("_pending_help", None)
         self._pending_interaction = data.get("_pending_interaction", None)
         self._pending_rare = data.get("_pending_rare", None)
-        self._per_stall_ms_triggered = set(data.get("_per_stall_ms_triggered", []))
+        # P0-α2：to_dict 序列化后元素是 [stall_id, affection] 数组——直接
+        # set() 会对 list 求 hash 抛 TypeError（触发过任意 per-stall milestone
+        # 的存档 load 必崩）。显式转回 tuple
+        self._per_stall_ms_triggered = set(
+            tuple(x) if isinstance(x, (list, tuple)) else x
+            for x in data.get("_per_stall_ms_triggered", [])
+        )
         self._help_cooldown = data.get("_help_cooldown", {})
         self._stall_item_cache = data.get("_stall_item_cache", {})
         self._season_stall_items = data.get("_season_stall_items", {})
+        # P1-12：当日运行时状态还原（与 to_dict 对应）——原来丢了之后
+        # stateless wrapper 重载会表现为：雨天加价消失、抹零折扣失效、
+        # 剧情价格/品质修正失效、聊天好感可无限刷、稀有发现重复触发
+        self._weather_price_mod = data.get("_weather_price_mod", 1.0)
+        self._stall_discounts = data.get("_stall_discounts", {})
+        self._storyline_effects = data.get("_storyline_effects", {})
+        self._daily_chat_gain = set(data.get("_daily_chat_gain", []))
+        for _rid in data.get("_rare_found", []):
+            setattr(self, f"_rare_found_{_rid}", True)
         if self.mystic:
             self.mystic.load_state(data.get("mystic_state") or {})
         return True
@@ -1342,6 +1381,10 @@ class MarketGame:
                 if any(s["id"] == step["id"] for s in c["steps"]):
                     chain = c
                     break
+            # P1-14：拷贝再标注——CHOICE_CHAINS 里的 step 是模块级共享 dict，
+            # 原地写 _chain_title 会污染 market_data 全局表（跨实例/跨进程），
+            # 且被污染的 dict 会随 _pending_chain_steps 一起进存档
+            step = dict(step)
             step['_chain_title'] = chain["title"] if chain else "事件"
             lines.append("")
             lines.append(self._format_choice_chain(step))
@@ -1402,8 +1445,13 @@ class MarketGame:
         # 捆绑销售诱惑——算计型摊主偶尔推销
         self._current_bundle = None
         if personality == "算计" and (self.rng() % 100) / 100 < 0.20:
+            # P1-15：流动摊的 sells 是 {季节: [菜品]}，直接 `bt["buy"] in sells`
+            # 只会拿"春/夏/秋/冬"键比对，捆绑销售对整类摊静默失效
+            _bundle_sells = stall.get("sells", [])
+            if isinstance(_bundle_sells, dict):
+                _bundle_sells = _bundle_sells.get(self.season, []) or []
             for bt in BUNDLE_TRICKS:
-                if bt["buy"] in stall.get("sells", []):
+                if bt["buy"] in _bundle_sells:
                     lines.append(f"{stall['owner']}：{bt['says']}")
                     self._current_bundle = bt
                     break
@@ -3263,7 +3311,11 @@ class MarketGame:
 
         # 算用了哪些食材
         used_names = set(ks["pot_contents"])
-        used_names.update(h.get("name") for h in ks.get("held_items", []))
+        # P0-6：held_items 存的是食材名字符串（hold 分支 extend 的是 name、
+        # put_back 按字符串 remove），当 dict 读 .get 会 AttributeError——
+        # 部分盛出后走「出锅」必崩
+        for h in ks.get("held_items", []):
+            used_names.add(h.get("name") if isinstance(h, dict) else h)
         for pd in ks.get("completed_dishes", []):
             used_names.update(pd.get("items", []))
 
@@ -5137,6 +5189,8 @@ class MarketGame:
                 if any(s["id"] == step["id"] for s in c["steps"]):
                     chain = c
                     break
+            # P1-14：拷贝再标注，不写共享 dict（同 visit_stall）
+            step = dict(step)
             step['_chain_title'] = chain["title"] if chain else "事件"
             lines.append(self._format_choice_chain(step))
             lines.append("")
@@ -5735,7 +5789,10 @@ class MarketGame:
             return self._help()
 
         # 还没开新局，自动开一局（"新局"指令本身下面会调，别代开导致双开跳天）
-        if self.day == 0 and instruction != "新局":
+        # P0-7：排除要覆盖整个「新局」家族——原来只排除精确 "新局"，
+        # 首局输入「新局 明天」会先被这里自动 new_day（0→1）、再被下面的
+        # 强制分支 new_day(force=True)（1→2），连开两天
+        if self.day == 0 and not instruction.startswith("新局"):
             self.new_day()
 
         # 新局——需要明确的"新局"指令，防止AI误触
@@ -6144,7 +6201,13 @@ class MarketGame:
 
     def _maybe_rare_find(self, stall):
         stall_cats = set()
-        for vname in stall.get("sells", []):
+        # P1-15：流动摊 sells 是 {季节: [菜品]}，先按当季取值再迭代——
+        # 直接迭代 dict 得到的是"春/夏/秋/冬"键，VEGGIES.get("春") 没 cat，
+        # 稀有发现对流动摊静默失效
+        _sells = stall.get("sells", [])
+        if isinstance(_sells, dict):
+            _sells = _sells.get(self.season, []) or []
+        for vname in _sells:
             cat = VEGGIES.get(vname, {}).get("cat")
             if cat:
                 stall_cats.add(cat)
@@ -6205,7 +6268,11 @@ class MarketGame:
         if self.day - last_help_day < 3:
             return None
         stall_cats = set()
-        for vname in stall.get("sells", []):
+        # P1-15：同 _maybe_rare_find——流动摊 sells 按当季取值
+        _sells = stall.get("sells", [])
+        if isinstance(_sells, dict):
+            _sells = _sells.get(self.season, []) or []
+        for vname in _sells:
             cat = VEGGIES.get(vname, {}).get("cat")
             if cat:
                 stall_cats.add(cat)
@@ -6320,9 +6387,11 @@ class MarketGame:
     def _time_warning(self):
         if self._market_closed:
             return "⏰ 散场了！摊主们开始收摊，你得赶紧走。"
-        if self.market_time == 1:
+        # P1-13：_detail_look 的 _tick_time(0.5) 会产生 x.5 浮点——
+        # ==1/==2 永不命中，散场预警静默丢失。改区间比较
+        if 0 < self.market_time <= 1:
             return "⏰ 快散场了，最多再逛一个摊。"
-        if self.market_time == 2:
+        if 1 < self.market_time <= 2:
             return "⏰ 时间不多了。"
         return ""
 

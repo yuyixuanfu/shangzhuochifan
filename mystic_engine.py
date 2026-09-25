@@ -168,7 +168,12 @@ class MysticLayer:
         persistent = self.state.get("persistent_stalls", [])
         if stall_id != today and stall_id not in persistent:
             if today:
-                return f"今天东角只有 {MYSTIC_STALL_BY_ID[today]['name']}，别的摊没出来。"
+                # P1-28：today 来自存档，脏档可能是失效 id——.get 降级，
+                # 与 handle_answer 的防御口径一致
+                today_s = MYSTIC_STALL_BY_ID.get(today)
+                if today_s:
+                    return f"今天东角只有 {today_s['name']}，别的摊没出来。"
+                return "今天东角什么都没有。"
             return "今天东角什么都没有。"
         # 累计进异宾摊次数（半夜菜场链用）
         self.state["mystic_visit_count"] = self.state.get("mystic_visit_count", 0) + 1
@@ -274,7 +279,9 @@ class MysticLayer:
     def maybe_recall(self):
         """30% 概率浮回一句旧告白。"""
         g = self.game
-        if g.rng() % 100 < 30 and self.state["confessions"]:
+        # P1-27：confessions 判空短路在前——先掷 rng 会在没有旧告白时也消耗
+        # 主 rng，污染后续事件的确定性（同 visit_mystic_stall 已修过的缺陷）
+        if self.state["confessions"] and g.rng() % 100 < 30:
             c = self.state["confessions"][-1]
             return f"💭 {MYSTIC_CONFESS_PREFIX}{c['answer']}"
         return None
@@ -292,7 +299,8 @@ class MysticLayer:
 
     def check_mystic_chains(self):
         """new_day 时检查隐藏任务线达成。返回解锁提示行列表。"""
-        g = self.game
+        # P1-29：原来有未使用的 `g = self.game` 死变量，已删——
+        # 条件与奖励分别在 _chain_condition_met/_apply_chain_reward 里自行取 game
         hints = []
         for chain in MYSTIC_CHAINS:
             if chain["id"] in self.state.get("unlocked_chains", []):
@@ -357,6 +365,7 @@ class MysticLayer:
             "progress": 0, "in_mystic": False, "today_stall": None,
             "today_question": None, "answered": False,
             "confessions": [], "asked": [], "time_loop_pending": False,
+            "time_loop_pending_day": -1,  # P0-9：缺此键时 staleness 校验会被 -1 短路掉
             "unpaid_count": 0, "last_visit_stall": None, "consec_count": 0,
             "unlocked_chains": [], "persistent_stalls": [], "mystic_visit_count": 0,
             "time_loop_just_happened": False,
@@ -364,4 +373,8 @@ class MysticLayer:
         for k, v in default.items():
             if k not in data:
                 data[k] = v
+        # P0-9：旧档带着 pending 标记却没有合法的 pending_day（脏标记）——
+        # 直接清除，否则任意一天都能触发时间循环回退
+        if data.get("time_loop_pending") and data.get("time_loop_pending_day", -1) < 0:
+            data["time_loop_pending"] = False
         self.state = data
